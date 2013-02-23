@@ -9,20 +9,25 @@ Example using ClientPool
     import tornadoasyncmemcache as memcache
     import time
     
-    ccs = memcache.ClientPool(['127.0.0.1:11211'], maxclients=100)
+    ccs = memcache.ClientPool(['127.0.0.1:11211'], maxclients=100, 
+        connect_timeout=0.05,request_timeout=0.1, server_retries = 1, dead_retry = 10)
     
     class MainHandler(tornado.web.RequestHandler):
       @tornado.web.asynchronous
       def get(self):
         time_str = time.strftime('%Y-%m-%d %H:%M:%S')
         ccs.set('test_data', 'Hello world @ %s' % time_str,
-                callback=self._get_start)
+                callback=self._get_start, fail_callback = self._on_fail)
     
       def _get_start(self, data):
-        ccs.get('test_data', callback=self._get_end)
+        ccs.get('test_data', callback=self._get_end, fail_callback = self.on_fail)
     
       def _get_end(self, data):
         self.write(data)
+        self.finish()
+    
+      def _on_fail(self, *args):
+        self.send_error(500)
         self.finish()
     
     application = tornado.web.Application([
