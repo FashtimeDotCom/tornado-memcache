@@ -39,9 +39,12 @@ import sys
 import socket
 import time
 import types
+import contextlib
 from tornado import iostream, ioloop
+from tornado import stack_context
 from functools import partial
 import collections
+from tornado.util import b, bytes_type
 try:
     import cPickle as pickle
 except ImportError:
@@ -90,16 +93,34 @@ class ClientPool(object):
                 for x in xrange(n)]
 
     def _do(self, cmd, *args, **kwargs):
+        fail_callback = None
+        if 'fail_callback' in kwargs:
+            fail_callback = kwargs['fail_callback']
+            del kwargs['fail_callback']
         if not self._clients:
             if self._maxclients > 0 and (len(self._clients)
                 + len(self._used) >= self._maxclients):
-                raise TooManyClients("Max of %d clients is already reached"
-                                     % self._maxclients)
-            self._clients.append(self._create_clients(1)[0])
+                fail_reason = "Max of %d clients is already reached" % self._maxclients
+                if fail_callback:
+                    fail_callback(fail_reason)
+                    return
+                else:
+                    raise TooManyClients(fail_reason)
+                self._clients.append(self._create_clients(1)[0])
         c = self._clients.popleft()
         kwargs['callback'] = partial(self._gen_cb, c=c, _cb=kwargs['callback'])
         self._used.append(c)
-        getattr(c, cmd)(*args, **kwargs)
+        context = partial(self._cleanup, fail_callback = partial(self._gen_cb, c=c, _cb= fail_callback))
+        with stack_context.StackContext(context):
+            getattr(c, cmd)(*args, **kwargs)
+
+    @contextlib.contextmanager
+    def _cleanup(self, fail_callback = None):
+        try:
+            yield
+        except _Error as e:
+            if fail_callback:
+                fail_callback(e.args)
 
     def __getattr__(self, name):
         if name in self.CMDS:
@@ -113,7 +134,8 @@ class ClientPool(object):
             self._clients.append(c)
         else:
             c.disconnect_all()
-        _cb(response, *args, **kwargs)
+        if _cb:
+            _cb(response, *args, **kwargs)
     
 
 class _Error(Exception):
@@ -164,9 +186,14 @@ class Client(object):
 #            cls._ASYNC_CLIENTS[io_loop] = instance
 #            return instance
     
-    def __init__(self, servers, debug=0, io_loop=None):
+    def __init__(self, servers, debug=0, io_loop=None, connect_timeout = None, request_timeout = None, dead_retry = None, server_retries = None):
         io_loop = io_loop or ioloop.IOLoop.instance()
         self.io_loop = io_loop
+        self.connect_timeout = connect_timeout
+        self.request_timeout = request_timeout
+        self.server_retries = server_retries if server_retries is not None else Client._SERVER_RETRIES
+        self.dead_retry = dead_retry
+        self._timeout = None
         self.set_servers(servers)
         self.debug = debug
         self.stats = {}
@@ -184,6 +211,31 @@ class Client(object):
 #        self.set_servers(servers)
 #        self.debug = debug
 #        self.stats = {}
+
+    def _set_timeout(self, server, callback):
+
+        if self.request_timeout:
+            def clear_and_call(*args, **kwargs):
+                self._clear_timeout()
+                callback(*args, **kwargs)
+            if self._timeout is not None:
+                self.io_loop.remove_timeout(self._timeout)
+            self._timeout = self.io_loop.add_timeout(
+                    time.time() + self.request_timeout,
+                    stack_context.wrap(partial(self._on_timeout, server)))
+            return clear_and_call
+        else:
+            return callback
+
+    def _clear_timeout(self):
+        if self._timeout is not None:
+            self.io_loop.remove_timeout(self._timeout)
+            self._timeout = None
+    
+    def _on_timeout(self, server):
+        self._timeout = None
+        server.mark_dead('Time out')
+        raise _Error('memcache call timeout')
     
     def set_servers(self, servers):
         """
@@ -195,7 +247,12 @@ class Client(object):
             2. Tuples of the form C{("host:port", weight)}, where C{weight} is
             an integer weight value.
         """
-        self.servers = [_Host(s, self.debuglog) for s in servers]
+        kwargs = dict(io_loop = self.io_loop)
+        #if self.connect_timeout:
+        #    kwargs['connect_timeout'] = self.connect_timeout 
+        if self.dead_retry:
+            kwargs['dead_retry'] = self.dead_retry 
+        self.servers = [_Host(s, self.debuglog, **kwargs) for s in servers]
         self._init_buckets()
 
     def debuglog(self, str):
@@ -221,20 +278,32 @@ class Client(object):
             for i in range(server.weight):
                 self.buckets.append(server)
 
-    def _get_server(self, key):
+    def _get_server(self, key, connect_callback, *args, **kwargs):
         if type(key) == types.TupleType:
             serverhash = key[0]
             key = key[1]
         else:
             serverhash = hash(key)
+        
+        retry = kwargs['retry'] if 'retry' in kwargs else 0
+        server = kwargs['server'] if 'server' in kwargs else None
 
-        for i in range(Client._SERVER_RETRIES):
-            server = self.buckets[serverhash % len(self.buckets)]
-            if server.connect():
-#                print "(using server %s)" % server
-                return server, key
-            serverhash = hash(str(serverhash) + str(i))
-        return None, None
+        if retry > 0:
+            server.mark_dead('connect failed')
+            if retry >= self.server_retries:
+                self._clear_timeout()
+                raise _Error('no server available')
+            serverhash = hash(str(serverhash)+str(retry))
+
+        server = self.buckets[serverhash % len(self.buckets)]
+        if self.connect_timeout:
+            if self._timeout is not None:
+                self.io_loop.remove_timeout(self._timeout)
+            self._timeout = self.io_loop.add_timeout(
+                    time.time() + self.connect_timeout,
+                    stack_context.wrap(partial(self._on_timeout, server)))
+        server.connect(callback = partial(connect_callback, server, key, *args), fail_callback = 
+                partial(self._get_server, (serverhash, key), connect_callback, *args, server = server, retry = retry +1))
 
     def disconnect_all(self):
         for s in self.servers:
@@ -246,7 +315,9 @@ class Client(object):
         @return: Nonzero on success.
         @rtype: int
         '''
-        server, key = self._get_server(key)
+        self._get_server(key, self._real_delete, time, callback)
+
+    def _real_delete(self, server, key, time, callback):
         if not server:
             self.finish(partial(callback,0))
         self._statlog('delete')
@@ -255,7 +326,7 @@ class Client(object):
         else:
             cmd = "delete %s" % key
 
-        server.send_cmd(cmd, callback=partial(self._delete_send_cb,server, callback))
+        server.send_cmd(cmd, callback=partial(self._delete_send_cb,server, self._set_timeout(server, callback)))
         
     def _delete_send_cb(self, server, callback):
         server.expect("DELETED",callback=partial(self._expect_cb, callback=callback))
@@ -304,13 +375,15 @@ class Client(object):
         self._incrdecr("decr", key, delta, callback=callback)
 
     def _incrdecr(self, cmd, key, delta, callback):
-        server, key = self._get_server(key)
+        self._get_server(key, self._real_incrdecr, cmd, delta, callback)
+
+    def _real_incrdecr(self, server, key, cmd, delta, callback):
         if not server:
             self.finish(partial(callback, 0))
         self._statlog(cmd)
         cmd = "%s %s %d" % (cmd, key, delta)
 
-        server.send_cmd(cmd, callback=partial(self._incrdecr_send_cb,server, callback))
+        server.send_cmd(cmd, callback=partial(self._incrdecr_send_cb,server, self._set_timeout(server, callback)))
         
     def _send_incrdecr_cb(self, server, callback):
         server.readline(callback=partial(self._send_incrdecr_check_cb, callback=callback))
@@ -357,7 +430,9 @@ class Client(object):
         self._set("set", key, val, time, callback)
     
     def _set(self, cmd, key, val, time, callback):
-        server, key = self._get_server(key)
+        self._get_server(key, self._real_set, cmd, val, time, callback)
+
+    def _real_set(self, server, key, cmd, val, time, callback):
         if not server:
             self.finish(partial(callback,0))
 
@@ -378,7 +453,7 @@ class Client(object):
         
         fullcmd = "%s %s %d %d %d\r\n%s" % (cmd, key, flags, time, len(val), val)
         
-        server.send_cmd(fullcmd, callback=partial(self._set_send_cb, server=server, callback=callback))
+        server.send_cmd(fullcmd, callback=partial(self._set_send_cb, server=server, callback=self._set_timeout(server, callback)))
         
     def _set_send_cb(self, server, callback):
         server.expect("STORED", callback=partial(self._expect_cb, value=None, callback=callback))
@@ -392,13 +467,16 @@ class Client(object):
         
         @return: The value or None.
         '''
-        server, key = self._get_server(key)
+        self._get_server(key, self._real_get, callback)
+
+    def _real_get(self, server, key, callback):
         if not server:
-            return None
+            self._clear_timeout()
+            raise _Error('No available server for %s' % key)
 
         self._statlog('get')
 
-        server.send_cmd("get %s" % key, partial(self._get_send_cb, server=server, callback=callback))
+        server.send_cmd("get %s" % key, partial(self._get_send_cb, server=server, callback=self._set_timeout(server, callback)))
         
     def _get_send_cb(self, server, callback):
         self._expectvalue(server, line=None, callback=partial(self._get_expectval_cb, server=server, callback=callback))
@@ -447,6 +525,7 @@ class Client(object):
         
     def _recv_value_cb(self, buf, flags, rlen, callback):
         if len(buf) != rlen:
+            self._clear_timeout()
             raise _Error("received %d bytes when expecting %d" % (len(buf), rlen))
 
         if len(buf) == rlen:
@@ -473,7 +552,7 @@ class Client(object):
 class _Host:
     _DEAD_RETRY = 30  # number of seconds before retrying a dead server.
 
-    def __init__(self, host, debugfunc=None):
+    def __init__(self, host, debugfunc=None, io_loop = None, dead_retry = None):
         if isinstance(host, types.TupleType):
             host = host[0]
             self.weight = host[1]
@@ -489,9 +568,11 @@ class _Host:
         if not debugfunc:
             debugfunc = lambda x: x
         self.debuglog = debugfunc
+        self.dead_retry = dead_retry if dead_retry is not None else _Host._DEAD_RETRY
+
+        self.io_loop = io_loop if io_loop is not None else ioloop.IOLoop.instance()
 
         self.deaduntil = 0
-        self.socket = None
         self.stream = None
     
     def _check_dead(self):
@@ -500,39 +581,39 @@ class _Host:
         self.deaduntil = 0
         return 0
 
-    def connect(self):
-        if self._get_socket():
-            return 1
-        return 0
+    def connect(self, callback, fail_callback = None):
+        return self._get_socket(callback, fail_callback)
 
     def mark_dead(self, reason):
         print "MemCache: %s: %s.  Marking dead." % (self, reason)
-        self.deaduntil = time.time() + _Host._DEAD_RETRY
+        if self.deaduntil == 0:
+	    self.deaduntil = time.time() + self.dead_retry
         self.close_socket()
         
-    def _get_socket(self):
+    def _get_socket(self, callback, fail_callback = None):
         if self._check_dead():
+            if fail_callback:
+                fail_callback()
+                return None
+            else:
+                return None
+        if self.stream:
+            callback()
             return None
-        if self.socket:
-            return self.socket
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # Python 2.3-ism:  s.settimeout(1)
-        try:
-            s.connect((self.ip, self.port))
-        except socket.error, msg:
-            self.mark_dead("connect: %s" % msg[1])
-            return None
-        self.socket = s
-        self.stream = iostream.IOStream(s)
+
+        addrinfo = socket.getaddrinfo(self.ip, self.port, socket.AF_INET, socket.SOCK_STREAM, 0, 0)
+        af, socktype, proto, canonname, sockaddr = addrinfo[0]
+        self.stream = iostream.IOStream(socket.socket(af, socktype, proto),
+                io_loop = self.io_loop)
         self.stream.debug=True
-        return s
+        self.stream.connect(sockaddr, callback)
+        return None
     
     def close_socket(self):
-        if self.socket:
+        if self.stream:
 #            self.socket.close()
             self.stream.close()
             self.stream = None
-            self.socket = None
 
     def send_cmd(self, cmd, callback):
 #        print "in sendcmd", repr(cmd), callback
